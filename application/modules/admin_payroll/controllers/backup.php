@@ -1,0 +1,514 @@
+<?php
+defined('BASEPATH') OR exit('No direct script access allowed');
+
+class Admin_calculate_payroll extends MY_Controller {
+
+	private $schedules = array();
+	private $attendance = array();
+	private $salary_details = array();
+	private $salary = 0;
+	private $cola_duration = 0;
+	private $total_cola_salary = 0;
+
+	//data array consist of (employee_id,salary,late_duration[minutes],undertime_duration[minutes],cola_duration,daily_date) for per date salary
+	private $data_array = array();
+	//data array consist of (employee_id,daily_date) for fixed salary	
+	private $data_emp = array();
+
+
+	
+	public function __construct() {
+		parent::__construct();	
+		page_redirect();
+		$this->load->model('Admin_payroll_model','payroll');
+		$this->page = "Calculate Payroll";
+	}
+	
+	public function index() {
+		if (admin_login()) {
+			$this->datatable_script = true;			
+			$this->ibox = true;
+			$this->ibox_header = "Calculate payroll";
+			$this->ibox_id = "ibox_files_uploaded";
+			$this->middle = "admin_payroll/Admin_calculate_payroll";
+			$this->admin_layout();
+		} else {
+			page_not_found();
+		}
+	}
+
+	/*holidays
+		returns {
+			2 - if double pay
+			1 - if 30% pay			
+			0 - Normal
+		}
+	*/
+	private function get_calendar_rate($date_duty) {
+		$date_holiday = $this->payroll->get_calendar_event($date_duty);		
+		if($date_holiday == 2) {
+			return 2;
+		}else if($date_holiday == 1) {
+			return 1;
+		}else {
+			return 0;
+		}
+	}
+
+	//returns late in minutes
+	private function compute_late($time_in,$late_time) {
+		$duty = new DateTime(date("H:i",strtotime($time_in)));
+		$late = new DateTime(date("H:i",strtotime($late_time)));		
+		$interval = $duty->diff($late);
+		$hours   = $interval->format('%h'); 
+		$minutes = $interval->format('%i');
+		$diff = ($hours * 60 + $minutes);
+
+		return $diff; 
+	}	
+
+	//returns undertime in minutes
+	private function compute_undertime($time_in,$undertime_out) {
+		$duty = new DateTime(date("H:i",strtotime($time_in)));
+		$undertime = new DateTime(date("H:i",strtotime($undertime_out)));
+		$interval = $undertime->diff($duty);
+		$hours   = $interval->format('%h'); 
+		$minutes = $interval->format('%i');
+		$diff = ($hours * 60 + $minutes);
+
+		return $diff;
+	}
+
+	//compute time in ug time out karon
+	private function timein_now_timeout_now($id,$start_date,$end_date,$time_in,$time_out,$cola_duration,$calculate) {					
+		if($cola_duration != 0) {
+			$this->total_cola_salary = (($this->salary * 0.1)/8)*($cola_duration);			
+		}		
+		$this->attendance = $this->payroll->get_attendance_same_now_end($id,$start_date,$end_date);							
+		foreach ($this->attendance as $key => $perdate) {
+			$date_status = $this->get_calendar_rate($perdate->time);			
+			$time_duty = $this->payroll->getTimeinByDate($perdate->time,$id);						
+			//kung late sya			
+			if(date("H:i",strtotime($time_duty[0]->time)) > date("H:i",strtotime($time_in)) ) {				
+				$late_diff = $this->compute_late($time_duty[0]->time,$time_in);
+				$deduct_late = ($this->salary/8)/60;
+				$total_deduct_late = $deduct_late * $late_diff;
+				//if late sya unya undertime pa gyod
+				$total_deduct_undertime = 0;
+				$undertime_diff = 0;
+				if(date("H:i:s",strtotime($time_duty[1]->time)) < date("H:i",strtotime($time_out))) {
+					$undertime_diff = $this->compute_undertime($time_duty[1]->time,$time_out);
+					$deduct_undertime = ($this->salary/8)/60;
+					$total_deduct_undertime = $deduct_undertime * $undertime_diff;
+				}								
+				switch ($date_status) {
+					case 0:
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => $late_diff, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;						
+					case 1:
+						$this->salary = ($this->salary * 0.3) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => $late_diff, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+					case 2:
+						$this->salary = ($this->salary * 2) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => $late_diff, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+				}				
+			}
+			//kung undertime sya
+			else if(date("H:i:s",strtotime($time_duty[1]->time)) < date("H:i",strtotime($time_out))) {
+				//print_r("hello undertime");				
+				$undertime_diff = $this->compute_undertime($time_duty[1]->time,$time_out);
+				$deduct = ($this->salary/8)/60;
+				$total_deduct = $deduct * $undertime_diff;
+				switch ($date_status) {
+					case 0:
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => 0, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;						
+					case 1:
+						$this->salary = ($this->salary * 0.3) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => 0, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+					case 2:
+						$this->salary = ($this->salary * 2) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => 0, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+				}
+			}
+			//kung wlay late
+			else {				
+				// print_r("hello walay late");
+				switch ($date_status) {
+					case 0:
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => ($this->total_cola_salary + $this->salary), "late_duration" => 0, "undertime_duration" => 0, "cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;						
+					case 1:
+						$this->salary = ($this->salary * 0.3) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => ($this->total_cola_salary + $this->salary), "late_duration" => 0, "undertime_duration" => 0, "cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+					case 2:
+						$this->salary = ($this->salary * 2) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => ($this->total_cola_salary + $this->salary), "late_duration" => 0, "undertime_duration" => 0, "cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+				}
+			}
+		}
+	}
+
+	private function timein_now_timeout_ugma($id,$start_date,$end_date,$time_in,$time_out,$cola_duration,$calculate) {				
+		if($cola_duration != 0) {
+			$this->total_cola_salary = (($this->salary * 0.1)/8)*($cola_duration);			
+		}	
+		$this->attendance = $this->payroll->get_attendance_not_same_now_end($id,$start_date,$end_date);
+		foreach ($this->attendance as $key => $perdate) {
+			$date_status = $this->get_calendar_rate($perdate->time);			
+			$time_duty = $this->payroll->getTimeinByDate($perdate->time,$id);						
+
+			//kung late sya			
+			if(date("H:i",strtotime($time_duty[0]->time)) > date("H:i",strtotime($time_in)) ) {								
+				$late_diff = $this->compute_late($time_duty[0]->time,$time_in);
+				$deduct_late = ($this->salary/8)/60;
+				$total_deduct_late = $deduct_late * $late_diff;
+				$total_deduct_undertime = 0;
+				//kung late sya unya undertime pa gyod
+				if(date("H:i:s",strtotime($time_duty[1]->time)) < date("H:i",strtotime($time_out))) {
+					$undertime_diff = $this->compute_undertime($time_duty[1]->time,$time_out);
+					$deduct_undertime = ($this->salary/8)/60;
+					$total_deduct_undertime = $deduct_undertime * $undertime_diff;
+				}								
+				switch ($date_status) {
+					case 0:
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => $late_diff, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;						
+					case 1:
+						$this->salary = ($this->salary * 0.3) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => $late_diff, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+					case 2:
+						$this->salary = ($this->salary * 2) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => $late_diff, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+				}					
+			}
+			//kung undertime
+			else if(date("H:i:s",strtotime($time_duty[1]->time)) < date("H:i",strtotime($time_out))) {				
+				$undertime_diff = $this->compute_undertime($time_duty[1]->time,$time_out);
+				$deduct = ($this->salary/8)/60;
+				$total_deduct = $deduct * $undertime_diff;
+				switch ($date_status) {
+					case 0:
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => 0, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;						
+					case 1:
+						$this->salary = ($this->salary * 0.3) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => 0, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+					case 2:
+						$this->salary = ($this->salary * 2) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => (($this->total_cola_salary + $this->salary) - ($total_deduct_late + $total_deduct_undertime)), "late_duration" => 0, "undertime_duration" => $undertime_diff ,"cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+				}
+			}
+			//kung wla syay late ug undertime
+			else {								
+				switch ($date_status) {
+					case 0:
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => ($this->total_cola_salary + $this->salary), "late_duration" => 0, "undertime_duration" => 0, "cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;						
+					case 1:
+						$this->salary = ($this->salary * 0.3) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => ($this->total_cola_salary + $this->salary), "late_duration" => 0, "undertime_duration" => 0, "cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+					case 2:
+						$this->salary = ($this->salary * 2) + $this->salary;
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "salary" => ($this->total_cola_salary + $this->salary), "late_duration" => 0, "undertime_duration" => 0, "cola_duration" => $this->cola_duration, "date" => $perdate->time]);
+						break;
+				}
+			}
+		}
+		
+
+	}
+
+	//return cola boolean
+	private function isBetween($from, $till, $input) {
+        $f = DateTime::createFromFormat('!H:i', $from);
+        $t = DateTime::createFromFormat('!H:i', $till);
+        $i = DateTime::createFromFormat('!H:i', $input);
+        if ($f > $t) $t->modify('+1 day');
+        return ($f <= $i && $i <= $t) || ($f <= $i->modify('+1 day') && $i <= $t);
+	}
+
+	//compare late and undertime and get the deductions from late and undertime.
+	private function check_duty($id,$start_date,$end_date,$calculate) {
+		// 0  = perday
+		// 1 = fixed
+		$this->salary_details = $this->payroll->get_salary_details($id);		
+		$this->salary = $this->salary_details[0]->amount;					
+		$this->schedules = $this->payroll->get_schedule($id,$start_date,$end_date);				
+		$time = '17:00';		
+		$cola_in = "22:00";
+		$cola_out = "6:00";		
+
+		//per day type salary
+		if($this->salary_details[0]->salary_status == 0) {
+			foreach ($this->schedules as $key => $schedule) {	
+				//kung iyang schedule time in karon ug time out karon			
+				if($schedule->time_in < $time  ) {										
+					$sample = date("H:i",strtotime($schedule->time_in));
+					$has_cola = $this->isBetween($cola_in,$cola_out,$sample);
+					if($has_cola == 1) {
+						$time_in_cola = new DateTime(date("H:i",strtotime($schedule->time_in)));
+						$time_out_cola = new DateTime(date("H:i",strtotime($cola_out)));		
+						$cola_hrs = $time_in_cola->diff($time_out_cola);
+						$hours   = $cola_hrs->format('%h');
+						$this->cola_duration = $hours;
+					}
+					$this->total_cola_salary = 0;
+					$this->timein_now_timeout_now($id,$start_date,$end_date,$schedule->time_in,$schedule->time_out,$this->cola_duration,$calculate);
+				}
+				//kung iyang schedule time in karon ug time out ugma			
+				else if($schedule->time_in > $time) {
+					$sample = date("H:i",strtotime($schedule->time_in));
+					$has_cola = $this->isBetween($cola_in,$cola_out,$sample);
+					if($has_cola == 1) {
+						$midnight = "23:00";
+						$midnight1 = "24:00";
+						$time_mid_cola = new DateTime(date("H:i",strtotime($midnight)));
+						$time_in_cola = new DateTime(date("H:i",strtotime($schedule->time_in)));
+						$time_out_cola = new DateTime(date("H:i",strtotime($cola_out)));		
+						$cola_hrs = $time_in_cola->diff($time_mid_cola);
+						$hours = $cola_hrs->format('%h') + 1;						
+						$time_mid1_cola = new DateTime(date("H:i",strtotime($midnight1)));
+						$cola_hrs1 = $time_mid1_cola->diff($time_out_cola);
+						$hours1 = $cola_hrs1->format('%h');						
+						$this->cola_duration = $hours + $hours1;											
+					}
+					$this->total_cola_salary = 0;
+					$this->timein_now_timeout_ugma($id,$start_date,$end_date,$schedule->time_in,$schedule->time_out,$this->cola_duration,$calculate);
+				}
+			}
+
+		//fixed type salary		
+		}else if($this->salary_details[0]->salary_status == 1) {			
+			foreach ($this->schedules as $key => $schedule) {
+				//kung iyang schedule time in karon ug time out karon			
+				if($schedule->time_in < $time  ) {	
+					$this->attendance = $this->payroll->get_attendance_same_now_end($id,$start_date,$end_date,$calculate);
+					foreach ($this->attendance as $key => $perdate) {
+						array_push($this->data_array,["employee_id" => $id, "calculate_id" => $calculate, "date" => $perdate->time]);
+					}
+					// $emp_name_by_id = array_column($this->data_emp, 'name', 'employee_id');
+					foreach ($this->data_emp as &$row) {
+						if($row['employee_id'] == $id) {
+							 $row['salary'] = $this->salary_details[0]->amount;
+						}					    
+					}
+					// print_r($this->data_emp);
+				}
+			} 
+		} 
+			
+	}	
+
+	public function compute_payroll($calc_status) {
+	$emp = array();
+		if (admin_login()) {
+			$start_date = check_date($this->input->post('date_start'), "Y-m-d");
+			$end_date = check_date($this->input->post('date_end'), "Y-m-d");
+			$salary_status = $this->input->post('salary_status');		
+			$calc_stat = $calc_status;				
+			
+			$emp = $this->payroll->get_all_emp($salary_status);
+			if($calc_stat == -1) {
+				$calculate = $this->payroll->record_calculate_date($start_date,$end_date,$salary_status);				
+			}			
+			else if($calc_stat >= 0) {
+				$update_calculate = $this->payroll->update_calculate_date($calc_stat,$salary_status,$start_date,$end_date);
+				$calculate = $this->payroll->record_calculate_date($start_date,$end_date,$salary_status);					
+			}
+			
+			foreach ($emp as $key => $value) {
+				$name = $value->firstname . " " . $value->middlename . " " . $value->lastname . " " . $value->name_ext;		
+				array_push($this->data_emp, ["employee_id" => $value->employee_id, "name" => $name]);
+				$this->check_duty($value->employee_id,$start_date,$end_date,$calculate);				
+			}
+
+			switch ($salary_status) {
+				case 0:					
+					$insert_daily = $this->payroll->insert_daily_salary_per_day($this->data_array);					
+					$result = array();
+					foreach ($this->data_array as $val) {
+					    if (!isset($result[$val['employee_id']]))
+					        $result[$val['employee_id']] = $val;
+					    else
+					        $result[$val['employee_id']]['salary'] += $val['salary'];
+					}
+					$result = array_values($result);
+
+					$emp_name_by_id = array_column($this->data_emp, 'name', 'employee_id');
+					foreach ($result as &$r) {
+					    $r['name'] = $emp_name_by_id[$r['employee_id']] ?? 'N/A';
+					}			
+
+					//data table fix
+					foreach ($result as $emp) {
+
+			            $row = array();  
+			            $row[] = $emp['employee_id'];
+			            $row[] = $emp['name'];
+			            $row[] = (float) number_format($emp['salary'],2, '.','');
+			            $row[] = '<button onclick="update_dept('."'".$emp['employee_id']."'".');" class="btn btn-primary btn-xs" data-toggle="tooltip" data-placement="right" title="View Payslip" id="btnR2"><i class="fa fa-file"></i></i></button>';	            	           
+
+			            $data[] = $row;
+			        }
+
+			        $output = array(   
+			            "data" => $data,
+			        );
+			        echo json_encode($output); 
+					break;
+
+				case 1:
+					print_r($this->data_array);
+					$insert_daily = $this->payroll->insert_fixed_salary($this->data_array);					
+					foreach ($this->data_emp as $emp) {				
+			            $row = array();  
+			            $row[] = $emp['employee_id'];
+			            $row[] = $emp['name'];
+			            $row[] = $emp['salary'];
+			            $row[] = '<button onclick="update_dept('."'".$emp['employee_id']."'".');" class="btn btn-primary btn-xs" data-toggle="tooltip" data-placement="right" title="View Payslip" id="btnR2"><i class="fa fa-file"></i></i></button>';	            	           
+
+			            $data[] = $row;
+			        }
+
+			        $output = array(   
+			            "data" => $data,
+			        );
+			        echo json_encode($output);
+					break;
+			}	
+		}else {
+			page_not_found();
+		}
+
+	}
+
+
+	//true - kung naay data
+	//false - kung walay data
+	public function check_data() {
+		if (admin_login()) { 
+			$json = array();
+			$nstart_date = check_date($this->input->get('date_start'), "Y-m-d");
+			$nend_date = check_date($this->input->get('date_end'), "Y-m-d");
+			$data_check = $this->payroll->check_data_between_date($nstart_date,$nend_date);										
+			if($data_check <= 0) {
+				$json['result'] = false;
+			}else {
+				$json['result'] = true;
+			}
+			header('Content-Type: application/json; charset=utf-8');
+			echo json_encode($json);
+		} else {
+			page_not_found();
+		}		
+	}
+
+	//false kung wala, true kung exist
+	public function check_calculate() {
+		if (admin_login()) {
+			$json = array();
+			$check_status = $this->input->get('status_salary');
+			$calc_date_start = check_date($this->input->get('date_start'), "Y-m-d");
+			$calc_date_end = check_date($this->input->get('date_end'), "Y-m-d");
+
+			$check = $this->payroll->check_if_already_calculated($calc_date_start,$calc_date_end,$check_status);
+			$json['result'] = $check;
+			header('Content-Type: application/json; charset=utf-8');
+			echo json_encode($json);
+		} else {
+			page_not_found();
+		}
+	}
+
+	public function show_already_calculated() {
+		if (admin_login()) {
+			$json = array();
+			$already_stat = $this->input->post('status_salary');
+			$already_start = check_date($this->input->post('date_start'), "Y-m-d");
+			$already_end = check_date($this->input->post('date_end'), "Y-m-d");			
+			$getCalculated = $this->payroll->already_calculated($already_start,$already_end,$already_stat);
+			if(!$getCalculated) {
+				echo "No data available";
+			}else {
+				foreach ($getCalculated as $emp) {										
+						$name = $emp->firstname . " " . $emp->middlename . " " . $emp->lastname . " " . $emp->name_ext;
+			            $row = array();			              
+			            $row[] = $emp->employee_id;
+			            $row[] = $name;
+			            $row[] = $emp->salary;
+			            $row[] = '<button onclick="update_dept('."'".$emp->employee_id."'".');" class="btn btn-primary btn-xs" data-toggle="tooltip" data-placement="right" title="View Details" id="btnR2"><i class="fa fa-file"></i></i></button>';	            	           
+			            $data[] = $row;
+			        }
+
+			        $output = array(   
+			            "data" => $data,
+			        );
+			        echo json_encode($output);
+			}
+		} else {
+			page_not_found();
+		}
+	}
+
+	public function getAllCalculated() {
+		if (admin_login()) {
+			$start = $this->input->get('start');
+			$end = $this->input->get('end');
+
+			$events = $this->payroll->getCalculatedDates($start,$end);
+			
+		}else {
+			page_not_found();
+		}
+	}
+}
+
+/* End of file Admin_view_payroll.php */
+/* Location: ./application/modules/admin_dashboard/controllers/Admin_view_payroll.php */
+
+//http://localhost/ci_payroll/admin_payroll/Admin_view_payroll/compute_payroll/2019-09-08/2019-09-21
+
+/*
+algo
+1. Kung iyang time-in between sa schedule - ok
+2. Date sa time-in nga status 1 pangitaon niya ang status 2
+	-if time-in is 5:00pm upwards ,then plus 1 date ang status 2
+	-if time-in is 5:00pm below ,then equal date ang status 1 and 2
+	-if time-in ra ang naa, then walay add sa number of duty ug salary.
+	-if time-out ra ang naa, then walay add sa number of duty ug salary.
+3. Check if naay late ug undertime
+	- allowance nga 15 minutes sa time-in
+4. Insert database ang undertime/late.
+5. Check if ang date range naay holiday x2 salary or 30% sa salary.
+6. Insert sa database ang final na salary per day.
+7. Reset tanan.
+
+
+questions
+1. if fixed iyang salary then deductions nalang ang e compute ?
+2. pila ang dugang sa salary if gabii ang duty ?
+3. unsa nga mga schedules ang naay time-in date now unya time-out date ugma ?
+
+*/
+
+
+/*
+
+to do list:
+time in karon - time out karon
+2. deductions 
+3. additionals
+
+*/
